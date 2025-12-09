@@ -1,0 +1,1 @@
+web: python lotm_bot_habitica.py
