@@ -228,9 +228,9 @@ def priority_to_difficulty(priority: float) -> str:
 
 # ---------- WEBHOOK HANDLER (HABITICA ONLY) ----------
 async def handle_habitica(request: web.Request):
-    secret = request.headers.get("X-WEBHOOK-SECRET", "")
-    if not secrets.compare_digest(secret, WEBHOOK_SECRET):
-        return web.Response(status=401, text="Unauthorized")
+   # secret = request.headers.get("X-WEBHOOK-SECRET", "")
+   # if not secrets.compare_digest(secret, WEBHOOK_SECRET):
+   #     return web.Response(status=401, text="Unauthorized")
 
     data = await request.json()
 
