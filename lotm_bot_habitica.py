@@ -228,21 +228,28 @@ def priority_to_difficulty(priority: float) -> str:
 
 # ---------- WEBHOOK HANDLER (HABITICA ONLY) ----------
 async def handle_habitica(request: web.Request):
-   # secret = request.headers.get("X-WEBHOOK-SECRET", "")
-   # if not secrets.compare_digest(secret, WEBHOOK_SECRET):
-   #     return web.Response(status=401, text="Unauthorized")
-
-    data = await request.json()
+    # Habitica webhooks do not send a secret header, so we skip validation
+    
+    try:
+        data = await request.json()
+    except Exception as e:
+        logger.error(f"Error parsing webhook JSON: {e}")
+        return web.Response(status=400, text="Invalid JSON")
 
     # Extract Habitica fields
     user_id = data.get("user", {}).get("id")
     task = data.get("task", {})
     direction = data.get("direction")
+    
+    logger.info(f"Webhook received: user_id={user_id}, task={task}, direction={direction}")
+    
     if not user_id or not task:
+        logger.warning(f"Invalid webhook: missing user_id or task")
         return web.Response(status=400, text="Invalid Webhook")
 
     discord_id = await resolve_habitica(user_id)
     if not discord_id:
+        logger.warning(f"Habitica user {user_id} not linked to Discord")
         return web.Response(status=404, text="Habitica user not linked")
 
     task_type = task.get("type")  # habit / daily / todo
@@ -252,6 +259,8 @@ async def handle_habitica(request: web.Request):
     xp = await get_xp_for(task_type, difficulty)
     if direction == "down":
         xp = -abs(xp)
+
+    logger.info(f"Processing: {user_id} â†’ Discord {discord_id}, {xp} XP ({task_type}, {difficulty})")
 
     # Apply XP change
     result = await add_xp(discord_id, xp)
@@ -263,6 +272,11 @@ async def handle_habitica(request: web.Request):
         channel = bot.get_channel(int(announce_id))
         if channel:
             await channel.send(announcement)
+            logger.info(f"Announcement sent to channel {announce_id}")
+        else:
+            logger.warning(f"Announce channel {announce_id} not found")
+    else:
+        logger.warning("No announce channel configured")
 
     # Fetch updated user
     user = await get_user(discord_id)
