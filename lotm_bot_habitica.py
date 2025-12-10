@@ -238,8 +238,8 @@ async def handle_habitica(request: web.Request):
         return web.Response(status=400, text="Invalid JSON")
 
     # Extract Habitica fields
-    user_id = data.get("user", {}).get("id")
     task = data.get("task", {})
+    user_id = task.get("userId") 
     direction = data.get("direction")
     
     logger.info(f"Webhook received: user_id={user_id}, task={task}, direction={direction}")
