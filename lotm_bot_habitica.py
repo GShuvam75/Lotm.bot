@@ -392,6 +392,17 @@ async def setthreshold(ctx, sequence: int, xp_required: int):
     await set_threshold(sequence, xp_required)
     await ctx.send("Threshold updated.")
 
+# NEW: Map pathway role
+@bot.command()
+@is_admin()
+async def setpathwayrole(ctx, pathway: int, role: discord.Role):
+    """Set the pathway role for this guild. Usage: !setpathwayrole 1 @PathwayRole"""
+    if pathway < 1 or pathway > NUM_PATHWAYS:
+        await ctx.send(f"Pathway must be between 1 and {NUM_PATHWAYS}.")
+        return
+    await set_pathway_role(ctx.guild.id, pathway, role.id)
+    await ctx.send(f"Pathway {pathway} → {role.mention}")
+
 @bot.command()
 @is_admin()
 async def maprole(ctx, pathway: int, sequence: int, role: discord.Role):
