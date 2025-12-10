@@ -232,6 +232,7 @@ async def handle_habitica(request: web.Request):
     
     try:
         data = await request.json()
+        logger.info(f"RAW WEBHOOK DATA: {json.dumps(data)[:500]}")
     except Exception as e:
         logger.error(f"Error parsing webhook JSON: {e}")
         return web.Response(status=400, text="Invalid JSON")
