@@ -131,6 +131,14 @@ async def get_xp_for(task_type: str, difficulty: str) -> int:
         row = await cur.fetchone()
         return int(row[0]) if row else 0
 
+async def set_pathway_role(guild_id: int, pathway: int, role_id: int):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+        INSERT OR REPLACE INTO pathway_role_map (guild_id, pathway, role_id)
+        VALUES (?, ?, ?)
+        """, (guild_id, pathway, role_id))
+        await db.commit()
+
 async def set_xp_map(task_type: str, difficulty: str, xp: int):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
