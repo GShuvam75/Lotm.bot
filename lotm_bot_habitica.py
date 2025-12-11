@@ -66,6 +66,21 @@ async def init_db():
             sequence INTEGER NOT NULL DEFAULT 9
         );
 
+        CREATE TABLE IF NOT EXISTS pathway_role_map (
+            guild_id INTEGER,
+            pathway INTEGER,
+            role_id INTEGER,
+            PRIMARY KEY (guild_id, pathway)
+        );
+
+        CREATE TABLE IF NOT EXISTS sequence_role_map (
+            guild_id INTEGER,
+            pathway INTEGER,
+            sequence INTEGER,
+            role_id INTEGER,
+            PRIMARY KEY (guild_id, pathway, sequence)
+        );
+
         CREATE TABLE IF NOT EXISTS habitica_link (
             habitica_user_id TEXT PRIMARY KEY,
             discord_id TEXT
