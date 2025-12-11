@@ -162,6 +162,30 @@ async def get_pathway_role(guild_id: int, pathway: int) -> Optional[int]:
         row = await cur.fetchone()
         return int(row[0]) if row else None
 
+async def apply_promotions(discord_id: str):
+    """Re-run promotion logic for a single user based on current XP."""
+    user = await get_user(discord_id)
+    if not user:
+        return user  # None
+
+    leveled = []
+    while True:
+        seq = user["sequence"]
+        if seq <= MIN_SEQUENCE:
+            break
+
+        thresh = await get_threshold(seq)
+        if user["xp"] >= thresh:
+            user["xp"] -= thresh
+            new_seq = seq - 1
+            await set_user(discord_id, user["xp"], user["pathway"], new_seq)
+            leveled.append((seq, new_seq))
+            user = await get_user(discord_id)
+        else:
+            break
+
+    return user
+
 async def set_xp_map(task_type: str, difficulty: str, xp: int):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
@@ -410,6 +434,77 @@ async def setannounce(ctx, ch: discord.TextChannel):
 async def link(ctx, habitica_user_id: str):
     await link_habitica(habitica_user_id, str(ctx.author.id))
     await ctx.send("Habitica account linked.")
+
+@bot.command()
+@is_admin()
+async def setuserxp(ctx, member: discord.Member, xp: int):
+    """
+    Set a user's XP directly and apply promotions.
+    Usage: !setuserxp @User 1500
+    """
+    discord_id = str(member.id)
+    u = await get_user(discord_id)
+    if not u:
+        await set_user(discord_id, xp, 1, MAX_SEQUENCE)
+    else:
+        await set_user(discord_id, xp, u["pathway"], u["sequence"])
+
+    u = await apply_promotions(discord_id)
+    await ctx.send(f"Set {member.mention}'s XP to {u['xp']}. Sequence is now {u['sequence']}.")
+
+
+@bot.command()
+@is_admin()
+async def addxp(ctx, member: discord.Member, amount: int):
+    """
+    Add XP to a user and apply promotions.
+    Usage: !addxp @User 200
+    """
+    discord_id = str(member.id)
+    u = await get_user(discord_id)
+    if not u:
+        await set_user(discord_id, amount, 1, MAX_SEQUENCE)
+    else:
+        new_xp = u["xp"] + amount
+        await set_user(discord_id, new_xp, u["pathway"], u["sequence"])
+
+    u = await apply_promotions(discord_id)
+    await ctx.send(f"Added {amount} XP to {member.mention}. XP: {u['xp']}, Sequence: {u['sequence']}.")
+
+@bot.command()
+@is_admin()
+async def subtractxp(ctx, member: discord.Member, amount: int):
+    """
+    Subtract XP from a user, apply demotion if XP goes below 0,
+    then re-run promotion logic.
+    Usage: !subtractxp @User 100
+    """
+    discord_id = str(member.id)
+    u = await get_user(discord_id)
+
+    # If user doesn't exist yet, create a default one
+    if not u:
+        await set_user(discord_id, 0, 1, MAX_SEQUENCE)
+        u = await get_user(discord_id)
+
+    # Subtract XP
+    new_xp = u["xp"] - amount
+
+    # Demotion logic: if XP < 0, reset to 0 and increase sequence (demote)
+    if new_xp < 0:
+        new_xp = 0
+        new_seq = min(u["sequence"] + 1, MAX_SEQUENCE)
+        await set_user(discord_id, new_xp, u["pathway"], new_seq)
+    else:
+        await set_user(discord_id, new_xp, u["pathway"], u["sequence"])
+
+    # Reload user and apply promotions in case XP is still enough
+    u = await apply_promotions(discord_id)
+
+    await ctx.send(
+        f"Subtracted {amount} XP from {member.mention}. "
+        f"XP: {u['xp']}, Sequence: {u['sequence']}."
+    )
 
 @bot.command()
 @is_admin()
