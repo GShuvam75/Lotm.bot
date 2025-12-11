@@ -453,7 +453,26 @@ async def xp(ctx, member: Optional[discord.Member]):
     if not u:
         await ctx.send("No data.")
         return
-    await ctx.send(f"{m.mention} â†’ XP: {u['xp']}, Pathway: {u['pathway']}, Sequence: {u['sequence']}")
+
+    guild = ctx.guild
+    pathway_num = u["pathway"]
+    seq_num = u["sequence"]
+
+    # Default to showing the number
+    pathway_label = f"{pathway_num}"
+
+    # Try to get the mapped pathway role name
+    pathway_role_id = await get_pathway_role(guild.id, pathway_num)
+    if pathway_role_id:
+        r = guild.get_role(pathway_role_id)
+        if r:
+            pathway_label = r.name
+
+    await ctx.send(
+        f"{m.mention} → XP: {u['xp']}, "
+        f"Pathway: {pathway_label}, "
+        f"Sequence: {seq_num}"
+    )
 
 @bot.command()
 async def leaderboard(ctx, top: int = 10):
