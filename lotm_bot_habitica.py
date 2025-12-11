@@ -154,6 +154,14 @@ async def set_pathway_role(guild_id: int, pathway: int, role_id: int):
         """, (guild_id, pathway, role_id))
         await db.commit()
 
+async def get_pathway_role(guild_id: int, pathway: int) -> Optional[int]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("""
+        SELECT role_id FROM pathway_role_map WHERE guild_id = ? AND pathway = ?
+        """, (guild_id, pathway))
+        row = await cur.fetchone()
+        return int(row[0]) if row else None
+
 async def set_xp_map(task_type: str, difficulty: str, xp: int):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
