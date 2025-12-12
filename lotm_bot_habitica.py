@@ -130,7 +130,7 @@ async def init_db():
 
 # ---------- DB HELPERS ----------
 async def get_config_value(key: str) -> Optional[str]:
-    async with aiosqlite.connect(DATABASE_PATH) as db:  # âœ… FIXED: was DDATABASE_PATH
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         cur = await db.execute("SELECT value FROM config WHERE key = ?", (key,))
         row = await cur.fetchone()
         return row[0] if row else None
@@ -162,37 +162,34 @@ async def get_pathway_role(guild_id: int, pathway: int) -> Optional[int]:
         row = await cur.fetchone()
         return int(row[0]) if row else None
 
-async def apply_promotions(discord_id: str):
-    """Re-run promotion logic for a single user based on current XP."""
-    user = await get_user(discord_id)
-    if not user:
-        return user  # None
+async def get_user(discord_id: str) -> Optional[dict]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("""
+        SELECT xp, pathway, sequence FROM users WHERE discord_id = ?
+        """, (discord_id,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        return {"xp": int(row[0]), "pathway": int(row[1]), "sequence": int(row[2])}
 
-    leveled = []
-    while True:
-        seq = user["sequence"]
-        if seq <= MIN_SEQUENCE:
-            break
-
-        thresh = await get_threshold(seq)
-        if user["xp"] >= thresh:
-            user["xp"] -= thresh
-            new_seq = seq - 1
-            await set_user(discord_id, user["xp"], user["pathway"], new_seq)
-            leveled.append((seq, new_seq))
-            user = await get_user(discord_id)
-        else:
-            break
-
-    return user
-
-async def set_xp_map(task_type: str, difficulty: str, xp: int):
+async def set_user(discord_id: str, xp: int, pathway: int, sequence: int):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
-        INSERT OR REPLACE INTO xp_map (task_type, difficulty, xp)
-        VALUES (?, ?, ?)
-        """, (task_type, difficulty, xp))
+        INSERT INTO users (discord_id, xp, pathway, sequence)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(discord_id)
+        DO UPDATE SET xp=excluded.xp, pathway=excluded.pathway, sequence=excluded.sequence
+        """, (discord_id, xp, pathway, sequence))
         await db.commit()
+
+async def add_xp(discord_id: str, xp_change: int) -> dict:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO users (discord_id) VALUES (?)", (discord_id,))
+        await db.execute("UPDATE users SET xp = xp + ? WHERE discord_id = ?", (xp_change, discord_id))
+        await db.commit()
+        cur = await db.execute("SELECT xp, pathway, sequence FROM users WHERE discord_id = ?", (discord_id,))
+        row = await cur.fetchone()
+        return {"xp": int(row[0]), "pathway": int(row[1]), "sequence": int(row[2])}
 
 async def get_threshold(sequence: int) -> int:
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -226,35 +223,6 @@ async def resolve_habitica(hid: str) -> Optional[str]:
         row = await cur.fetchone()
         return row[0] if row else None
 
-async def get_user(discord_id: str) -> Optional[dict]:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cur = await db.execute("""
-        SELECT xp, pathway, sequence FROM users WHERE discord_id = ?
-        """, (discord_id,))
-        row = await cur.fetchone()
-        if not row:
-            return None
-        return {"xp": int(row[0]), "pathway": int(row[1]), "sequence": int(row[2])}
-
-async def set_user(discord_id: str, xp: int, pathway: int, sequence: int):
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute("""
-        INSERT INTO users (discord_id, xp, pathway, sequence)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(discord_id)
-        DO UPDATE SET xp=excluded.xp, pathway=excluded.pathway, sequence=excluded.sequence
-        """, (discord_id, xp, pathway, sequence))
-        await db.commit()
-
-async def add_xp(discord_id: str, xp_change: int) -> dict:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO users (discord_id) VALUES (?)", (discord_id,))
-        await db.execute("UPDATE users SET xp = xp + ? WHERE discord_id = ?", (xp_change, discord_id))
-        await db.commit()
-        cur = await db.execute("SELECT xp, pathway, sequence FROM users WHERE discord_id = ?", (discord_id,))
-        row = await cur.fetchone()
-        return {"xp": int(row[0]), "pathway": int(row[1]), "sequence": int(row[2])}
-
 async def get_role(pathway: int, sequence: int) -> Optional[int]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cur = await db.execute("""
@@ -271,6 +239,71 @@ async def map_role(pathway: int, sequence: int, role_id: int):
         """, (pathway, sequence, role_id))
         await db.commit()
 
+# ---------- PROMOTION LOGIC ----------
+async def apply_promotions(discord_id: str):
+    """Re-run promotion logic for a single user based on current XP."""
+    user = await get_user(discord_id)
+    if not user:
+        return user  # None
+
+    leveled = []
+    while True:
+        seq = user["sequence"]
+        if seq <= MIN_SEQUENCE:
+            break
+
+        thresh = await get_threshold(seq)
+        if user["xp"] >= thresh:
+            user["xp"] -= thresh
+            new_seq = seq - 1
+            await set_user(discord_id, user["xp"], user["pathway"], new_seq)
+            leveled.append((seq, new_seq))
+            user = await get_user(discord_id)
+        else:
+            break
+
+    return user
+
+# ========== ROLE SYNC HELPER (NEW) ==========
+async def sync_user_roles(discord_id: str, new_sequence: int):
+    """
+    Remove all old sequence roles from this user and add the new sequence role.
+    Runs on EVERY guild the bot and user share.
+    Uses the role_map table to find (pathway + sequence -> role_id).
+    """
+    user = await get_user(discord_id)
+    if not user:
+        logger.warning(f"sync_user_roles: User {discord_id} not found in DB")
+        return
+
+    pathway = user["pathway"]
+
+    # Loop through all guilds bot shares with user
+    for guild in bot.guilds:
+        member = guild.get_member(int(discord_id))
+        if not member:
+            continue
+
+        # Remove ALL old sequence roles for this pathway
+        for seq in range(MIN_SEQUENCE, MAX_SEQUENCE + 1):
+            role_id = await get_role(pathway, seq)
+            if not role_id:
+                continue
+            role = guild.get_role(role_id)
+            if role and role in member.roles:
+                await member.remove_roles(role, reason="Sequence change")
+                logger.info(f"Removed role {role.name} from {member.id}")
+
+        # Add new role for the new sequence
+        new_role_id = await get_role(pathway, new_sequence)
+        if new_role_id:
+            new_role = guild.get_role(new_role_id)
+            if new_role:
+                await member.add_roles(new_role, reason="Sequence change")
+                logger.info(f"Added role {new_role.name} to {member.id}")
+        else:
+            logger.warning(f"No role mapped for pathway={pathway}, sequence={new_sequence}")
+
 # ---------- DIFFICULTY CONVERSION ----------
 def priority_to_difficulty(priority: float) -> str:
     if priority <= 1:
@@ -281,10 +314,13 @@ def priority_to_difficulty(priority: float) -> str:
         return "medium"
     return "hard"
 
-# ---------- WEBHOOK HANDLER (HABITICA ONLY) ----------
+# ========== WEBHOOK HANDLER WITH ROLE SYNC ==========
 async def handle_habitica(request: web.Request):
-    # Habitica webhooks do not send a secret header, so we skip validation
-    
+    """
+    Webhook handler for Habitica updates.
+    Handles: XP gain/loss, demotion (XP < 0), promotion (XP >= threshold).
+    Syncs roles automatically for each state change.
+    """
     try:
         data = await request.json()
         logger.info(f"RAW WEBHOOK DATA: {json.dumps(data)[:500]}")
@@ -316,7 +352,7 @@ async def handle_habitica(request: web.Request):
     if direction == "down":
         xp = -abs(xp)
 
-    logger.info(f"Processing: {user_id} â†’ Discord {discord_id}, {xp} XP ({task_type}, {difficulty})")
+    logger.info(f"Processing: {user_id} → Discord {discord_id}, {xp} XP ({task_type}, {difficulty})")
 
     # Apply XP change
     result = await add_xp(discord_id, xp)
@@ -329,42 +365,28 @@ async def handle_habitica(request: web.Request):
         if channel:
             await channel.send(announcement)
             logger.info(f"Announcement sent to channel {announce_id}")
-        else:
-            logger.warning(f"Announce channel {announce_id} not found")
-    else:
-        logger.warning("No announce channel configured")
 
     # Fetch updated user
     user = await get_user(discord_id)
+    old_sequence = user["sequence"]
 
-    # ---------- DEMOTION (Mode B) ----------
+    # ========== DEMOTION ==========
     if user["xp"] < 0:
-        old_seq = user["sequence"]
-        new_seq = min(old_seq + 1, MAX_SEQUENCE)
+        new_seq = min(old_sequence + 1, MAX_SEQUENCE)
         await set_user(discord_id, 0, user["pathway"], new_seq)
+        logger.info(f"DEMOTION: {discord_id} sequence {old_sequence} → {new_seq}, XP reset to 0")
 
-        # Update roles
-        for g in bot.guilds:
-            member = g.get_member(int(discord_id))
-            if member:
-                old_role_id = await get_role(user["pathway"], old_seq)
-                new_role_id = await get_role(user["pathway"], new_seq)
-                if old_role_id:
-                    old_role = g.get_role(old_role_id)
-                    if old_role in member.roles:
-                        await member.remove_roles(old_role, reason="Demotion")
-                if new_role_id:
-                    new_role = g.get_role(new_role_id)
-                    await member.add_roles(new_role, reason="Demotion")
+        # Sync roles after demotion
+        await sync_user_roles(discord_id, new_seq)
 
         if announce_id:
             channel = bot.get_channel(int(announce_id))
             if channel:
-                await channel.send(f"<@{discord_id}> has been demoted ({old_seq} â†’ {new_seq}).")
+                await channel.send(f"<@{discord_id}> has been demoted ({old_sequence} → {new_seq}).")
 
         user = await get_user(discord_id)
 
-    # ---------- PROMOTION LOOP ----------
+    # ========== PROMOTION LOOP ==========
     leveled = []
     while True:
         seq = user["sequence"]
@@ -377,28 +399,19 @@ async def handle_habitica(request: web.Request):
             new_seq = seq - 1
             await set_user(discord_id, user["xp"], user["pathway"], new_seq)
             leveled.append((seq, new_seq))
-
-            # Role update
-            for g in bot.guilds:
-                member = g.get_member(int(discord_id))
-                if member:
-                    old_role = await get_role(user["pathway"], seq)
-                    new_role = await get_role(user["pathway"], new_seq)
-                    if old_role:
-                        r = g.get_role(old_role)
-                        if r in member.roles:
-                            await member.remove_roles(r)
-                    if new_role:
-                        await member.add_roles(g.get_role(new_role))
+            logger.info(f"PROMOTION: {discord_id} sequence {seq} → {new_seq}, XP now {user['xp']}")
 
             if announce_id:
-                ch = bot.get_channel(int(announce_id))
-                if ch:
-                    await ch.send(f"<@{discord_id}> advanced from {seq} â†’ {new_seq}!")
+                channel = bot.get_channel(int(announce_id))
+                if channel:
+                    await channel.send(f"<@{discord_id}> advanced from sequence {seq} → {new_seq}!")
 
             user = await get_user(discord_id)
         else:
             break
+
+    # Final role sync after all promotions
+    await sync_user_roles(discord_id, user["sequence"])
 
     return web.json_response({"ok": True, "xp": xp, "leveled": leveled})
 
@@ -439,7 +452,7 @@ async def link(ctx, habitica_user_id: str):
 @is_admin()
 async def setuserxp(ctx, member: discord.Member, xp: int):
     """
-    Set a user's XP directly and apply promotions.
+    Set a user's XP directly and apply promotions + sync roles.
     Usage: !setuserxp @User 1500
     """
     discord_id = str(member.id)
@@ -450,6 +463,8 @@ async def setuserxp(ctx, member: discord.Member, xp: int):
         await set_user(discord_id, xp, u["pathway"], u["sequence"])
 
     u = await apply_promotions(discord_id)
+    await sync_user_roles(discord_id, u["sequence"])
+
     await ctx.send(f"Set {member.mention}'s XP to {u['xp']}. Sequence is now {u['sequence']}.")
 
 
@@ -457,7 +472,7 @@ async def setuserxp(ctx, member: discord.Member, xp: int):
 @is_admin()
 async def addxp(ctx, member: discord.Member, amount: int):
     """
-    Add XP to a user and apply promotions.
+    Add XP to a user and apply promotions + sync roles.
     Usage: !addxp @User 200
     """
     discord_id = str(member.id)
@@ -469,25 +484,24 @@ async def addxp(ctx, member: discord.Member, amount: int):
         await set_user(discord_id, new_xp, u["pathway"], u["sequence"])
 
     u = await apply_promotions(discord_id)
+    await sync_user_roles(discord_id, u["sequence"])
+
     await ctx.send(f"Added {amount} XP to {member.mention}. XP: {u['xp']}, Sequence: {u['sequence']}.")
 
 @bot.command()
 @is_admin()
 async def subtractxp(ctx, member: discord.Member, amount: int):
     """
-    Subtract XP from a user, apply demotion if XP goes below 0,
-    then re-run promotion logic.
+    Subtract XP from a user, apply demotion if XP goes below 0, then re-run promotion logic + sync roles.
     Usage: !subtractxp @User 100
     """
     discord_id = str(member.id)
     u = await get_user(discord_id)
 
-    # If user doesn't exist yet, create a default one
     if not u:
         await set_user(discord_id, 0, 1, MAX_SEQUENCE)
         u = await get_user(discord_id)
 
-    # Subtract XP
     new_xp = u["xp"] - amount
 
     # Demotion logic: if XP < 0, reset to 0 and increase sequence (demote)
@@ -498,8 +512,8 @@ async def subtractxp(ctx, member: discord.Member, amount: int):
     else:
         await set_user(discord_id, new_xp, u["pathway"], u["sequence"])
 
-    # Reload user and apply promotions in case XP is still enough
     u = await apply_promotions(discord_id)
+    await sync_user_roles(discord_id, u["sequence"])
 
     await ctx.send(
         f"Subtracted {amount} XP from {member.mention}. "
@@ -509,7 +523,12 @@ async def subtractxp(ctx, member: discord.Member, amount: int):
 @bot.command()
 @is_admin()
 async def setxp(ctx, task_type: str, difficulty: str, xp: int):
-    await set_xp_map(task_type, difficulty, xp)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+        INSERT OR REPLACE INTO xp_map (task_type, difficulty, xp)
+        VALUES (?, ?, ?)
+        """, (task_type, difficulty, xp))
+        await db.commit()
     await ctx.send("XP updated.")
 
 @bot.command()
@@ -518,7 +537,6 @@ async def setthreshold(ctx, sequence: int, xp_required: int):
     await set_threshold(sequence, xp_required)
     await ctx.send("Threshold updated.")
 
-# NEW: Map pathway role
 @bot.command()
 @is_admin()
 async def setpathwayrole(ctx, pathway: int, role: discord.Role):
@@ -532,8 +550,9 @@ async def setpathwayrole(ctx, pathway: int, role: discord.Role):
 @bot.command()
 @is_admin()
 async def maprole(ctx, pathway: int, sequence: int, role: discord.Role):
+    """Map a Discord role to a pathway + sequence combo. Usage: !maprole 1 5 @RoleName"""
     await map_role(pathway, sequence, role.id)
-    await ctx.send("Role mapped.")
+    await ctx.send(f"Pathway {pathway}, Sequence {sequence} → {role.mention}")
 
 @bot.command()
 @is_admin()
@@ -579,7 +598,8 @@ async def leaderboard(ctx, top: int = 10):
     if not rows:
         await ctx.send("No data.")
         return
-    text = "\n".join([f"{i+1}. <@{r[0]}> â€” {r[1]} XP" for i, r in enumerate(rows)])
+    text = "
+".join([f"{i+1}. <@{r[0]}> – {r[1]} XP" for i, r in enumerate(rows)])
     await ctx.send(text)
 
 # ---------- MAIN ASYNC RUNNER ----------
