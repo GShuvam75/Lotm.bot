@@ -282,7 +282,12 @@ async def sync_user_roles(discord_id: str, new_sequence: int):
     for guild in bot.guilds:
         member = guild.get_member(int(discord_id))
         if not member:
-            continue
+            try:
+                member = await guild.fetch_member(int(discord_id))
+            except discord.NotFound:
+                continue
+            except discord.HTTPException:
+                continue
 
         # Remove ALL old sequence roles for this pathway
         for seq in range(MIN_SEQUENCE, MAX_SEQUENCE + 1):
