@@ -530,8 +530,7 @@ async def leaderboard(ctx, top: int = 10):
     if not rows:
         await ctx.send("No data.")
         return
-    text = "
-".join([f"{i+1}. <@{r['discord_id']}> – {r['xp']} XP" for i, r in enumerate(rows)])
+    text = "\n".join([f"{i+1}. <@{r['discord_id']}> – {r['xp']} XP" for i, r in enumerate(rows)])
     await ctx.send(text)
 
 # ---------- MAIN ----------
