@@ -1,10 +1,11 @@
 import os
 import asyncio
-import asyncpg  # NEW: install with `pip install asyncpg`
+import aiosqlite
 from aiohttp import web
 import json
 import logging
-from typing import Optional
+import secrets
+from typing import Optional, Tuple, List
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -16,9 +17,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "REPLACE_WITH_YOUR_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret")
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
-
-# PostgreSQL connection (Railway provides this)
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/lotm")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "lotm.db")
 
 # XP mapping (can be changed with !setxp)
 DEFAULT_XP_MAP = {
@@ -27,33 +26,39 @@ DEFAULT_XP_MAP = {
     "todo":  {"trivial": 5, "easy": 15, "medium": 50, "hard": 100},
 }
 
+# Exponential thresholds (Option B)
 DEFAULT_SEQUENCE_THRESHOLDS = {
-    9: 900, 8: 1100, 7: 1500, 6: 1800, 5: 2400,
-    4: 3200, 3: 4200, 2: 5500, 1: 7000, 0: 10000, -1: 50000
+    9: 900,
+    8: 1100,
+    7: 1500,
+    6: 1800,
+    5: 2400,
+    4: 3200,
+    3: 4200,
+    2: 5500,
+    1: 7000,
+    0: 10000,
+    -1: 50000
 }
 
 MAX_SEQUENCE = 9
-MIN_SEQUENCE = -1
+MIN_SEQUENCE = -1  # ascended top
 NUM_PATHWAYS = 22
 
+# Logging
 logger = logging.getLogger("lotm")
 logging.basicConfig(level=logging.INFO)
 
+# intents
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- GLOBAL DB POOL ----------
-db_pool = None
-
+# ---------- DATABASE INIT ----------
 async def init_db():
-    """Initialize PostgreSQL connection pool and create tables."""
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=5, max_size=10)
-    
-    async with db_pool.acquire() as conn:
-        await conn.executescript("""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             discord_id TEXT PRIMARY KEY,
             xp INTEGER NOT NULL DEFAULT 0,
@@ -62,17 +67,17 @@ async def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS pathway_role_map (
-            guild_id BIGINT,
+            guild_id INTEGER,
             pathway INTEGER,
-            role_id BIGINT,
+            role_id INTEGER,
             PRIMARY KEY (guild_id, pathway)
         );
 
         CREATE TABLE IF NOT EXISTS sequence_role_map (
-            guild_id BIGINT,
+            guild_id INTEGER,
             pathway INTEGER,
             sequence INTEGER,
-            role_id BIGINT,
+            role_id INTEGER,
             PRIMARY KEY (guild_id, pathway, sequence)
         );
 
@@ -96,7 +101,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS role_map (
             pathway INTEGER,
             sequence INTEGER,
-            role_id BIGINT,
+            role_id INTEGER,
             PRIMARY KEY (pathway, sequence)
         );
 
@@ -106,127 +111,140 @@ async def init_db():
         );
         """)
 
-        # Populate defaults (first time only)
+        # Populate XP map (first time)
         for t, m in DEFAULT_XP_MAP.items():
             for d, xp in m.items():
-                await conn.execute("""
-                    INSERT INTO xp_map (task_type, difficulty, xp)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT DO NOTHING
-                """, t, d, xp)
+                await db.execute("""
+                    INSERT OR IGNORE INTO xp_map (task_type, difficulty, xp)
+                    VALUES (?, ?, ?)
+                """, (t, d, xp))
 
+        # Populate thresholds
         for seq, xp_req in DEFAULT_SEQUENCE_THRESHOLDS.items():
-            await conn.execute("""
-                INSERT INTO sequence_thresholds (sequence, xp_required)
-                VALUES ($1, $2)
-                ON CONFLICT DO NOTHING
-            """, seq, xp_req)
+            await db.execute("""
+                INSERT OR IGNORE INTO sequence_thresholds (sequence, xp_required)
+                VALUES (?, ?)
+            """, (seq, xp_req))
 
-# ---------- DB HELPERS (PostgreSQL versions) ----------
+        await db.commit()
+
+# ---------- DB HELPERS ----------
 async def get_config_value(key: str) -> Optional[str]:
-    async with db_pool.acquire() as conn:
-        result = await conn.fetchval("SELECT value FROM config WHERE key = $1", key)
-        return result
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("SELECT value FROM config WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        return row[0] if row else None
 
 async def set_config_value(key: str, value: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO config (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
-            key, value
-        )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+        await db.commit()
 
 async def get_xp_for(task_type: str, difficulty: str) -> int:
-    async with db_pool.acquire() as conn:
-        result = await conn.fetchval(
-            "SELECT xp FROM xp_map WHERE task_type = $1 AND difficulty = $2",
-            task_type, difficulty
-        )
-        return int(result) if result else 0
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("SELECT xp FROM xp_map WHERE task_type = ? AND difficulty = ?", (task_type, difficulty))
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
 async def set_pathway_role(guild_id: int, pathway: int, role_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO pathway_role_map (guild_id, pathway, role_id) VALUES ($1, $2, $3) ON CONFLICT (guild_id, pathway) DO UPDATE SET role_id = $3",
-            guild_id, pathway, role_id
-        )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+        INSERT OR REPLACE INTO pathway_role_map (guild_id, pathway, role_id)
+        VALUES (?, ?, ?)
+        """, (guild_id, pathway, role_id))
+        await db.commit()
 
 async def get_pathway_role(guild_id: int, pathway: int) -> Optional[int]:
-    async with db_pool.acquire() as conn:
-        result = await conn.fetchval(
-            "SELECT role_id FROM pathway_role_map WHERE guild_id = $1 AND pathway = $2",
-            guild_id, pathway
-        )
-        return int(result) if result else None
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("""
+        SELECT role_id FROM pathway_role_map WHERE guild_id = ? AND pathway = ?
+        """, (guild_id, pathway))
+        row = await cur.fetchone()
+        return int(row[0]) if row else None
 
 async def get_user(discord_id: str) -> Optional[dict]:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT xp, pathway, sequence FROM users WHERE discord_id = $1",
-            discord_id
-        )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("""
+        SELECT xp, pathway, sequence FROM users WHERE discord_id = ?
+        """, (discord_id,))
+        row = await cur.fetchone()
         if not row:
             return None
-        return {"xp": int(row['xp']), "pathway": int(row['pathway']), "sequence": int(row['sequence'])}
+        return {"xp": int(row[0]), "pathway": int(row[1]), "sequence": int(row[2])}
 
 async def set_user(discord_id: str, xp: int, pathway: int, sequence: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (discord_id, xp, pathway, sequence) VALUES ($1, $2, $3, $4) ON CONFLICT (discord_id) DO UPDATE SET xp = $2, pathway = $3, sequence = $4",
-            discord_id, xp, pathway, sequence
-        )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+        INSERT INTO users (discord_id, xp, pathway, sequence)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(discord_id)
+        DO UPDATE SET xp=excluded.xp, pathway=excluded.pathway, sequence=excluded.sequence
+        """, (discord_id, xp, pathway, sequence))
+        await db.commit()
 
 async def add_xp(discord_id: str, xp_change: int) -> dict:
-    async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO users (discord_id) VALUES ($1) ON CONFLICT DO NOTHING", discord_id)
-        await conn.execute("UPDATE users SET xp = xp + $1 WHERE discord_id = $2", xp_change, discord_id)
-        row = await conn.fetchrow("SELECT xp, pathway, sequence FROM users WHERE discord_id = $1", discord_id)
-        return {"xp": int(row['xp']), "pathway": int(row['pathway']), "sequence": int(row['sequence'])}
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO users (discord_id) VALUES (?)", (discord_id,))
+        await db.execute("UPDATE users SET xp = xp + ? WHERE discord_id = ?", (xp_change, discord_id))
+        await db.commit()
+        cur = await db.execute("SELECT xp, pathway, sequence FROM users WHERE discord_id = ?", (discord_id,))
+        row = await cur.fetchone()
+        return {"xp": int(row[0]), "pathway": int(row[1]), "sequence": int(row[2])}
 
 async def get_threshold(sequence: int) -> int:
-    async with db_pool.acquire() as conn:
-        result = await conn.fetchval("SELECT xp_required FROM sequence_thresholds WHERE sequence = $1", sequence)
-        return int(result) if result else DEFAULT_SEQUENCE_THRESHOLDS.get(sequence, 1000)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("SELECT xp_required FROM sequence_thresholds WHERE sequence = ?", (sequence,))
+        r = await cur.fetchone()
+        if r:
+            return int(r[0])
+        return DEFAULT_SEQUENCE_THRESHOLDS.get(sequence, 1000)
 
 async def set_threshold(sequence: int, xp_required: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO sequence_thresholds (sequence, xp_required) VALUES ($1, $2) ON CONFLICT (sequence) DO UPDATE SET xp_required = $2",
-            sequence, xp_required
-        )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+        INSERT OR REPLACE INTO sequence_thresholds (sequence, xp_required)
+        VALUES (?, ?)
+        """, (sequence, xp_required))
+        await db.commit()
 
 async def link_habitica(hid: str, discord_id: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO habitica_link (habitica_user_id, discord_id) VALUES ($1, $2) ON CONFLICT (habitica_user_id) DO UPDATE SET discord_id = $2",
-            hid, discord_id
-        )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+        INSERT OR REPLACE INTO habitica_link (habitica_user_id, discord_id)
+        VALUES (?, ?)
+        """, (hid, discord_id))
+        await db.commit()
 
 async def resolve_habitica(hid: str) -> Optional[str]:
-    async with db_pool.acquire() as conn:
-        result = await conn.fetchval("SELECT discord_id FROM habitica_link WHERE habitica_user_id = $1", hid)
-        return result
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("""
+        SELECT discord_id FROM habitica_link WHERE habitica_user_id = ?
+        """, (hid,))
+        row = await cur.fetchone()
+        return row[0] if row else None
 
 async def get_role(pathway: int, sequence: int) -> Optional[int]:
-    async with db_pool.acquire() as conn:
-        result = await conn.fetchval(
-            "SELECT role_id FROM role_map WHERE pathway = $1 AND sequence = $2",
-            pathway, sequence
-        )
-        return int(result) if result else None
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("""
+        SELECT role_id FROM role_map WHERE pathway = ? AND sequence = ?
+        """, (pathway, sequence))
+        row = await cur.fetchone()
+        return int(row[0]) if row else None
 
 async def map_role(pathway: int, sequence: int, role_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO role_map (pathway, sequence, role_id) VALUES ($1, $2, $3) ON CONFLICT (pathway, sequence) DO UPDATE SET role_id = $3",
-            pathway, sequence, role_id
-        )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+        INSERT OR REPLACE INTO role_map (pathway, sequence, role_id)
+        VALUES (?, ?, ?)
+        """, (pathway, sequence, role_id))
+        await db.commit()
 
 # ---------- PROMOTION LOGIC ----------
 async def apply_promotions(discord_id: str):
     """Re-run promotion logic for a single user based on current XP."""
     user = await get_user(discord_id)
     if not user:
-        return user
+        return user  # None
 
     leveled = []
     while True:
@@ -246,9 +264,13 @@ async def apply_promotions(discord_id: str):
 
     return user
 
-# ========== ROLE SYNC HELPER ==========
+# ========== ROLE SYNC HELPER (NEW) ==========
 async def sync_user_roles(discord_id: str, new_sequence: int):
-    """Remove all old sequence roles and add the new sequence role."""
+    """
+    Remove all old sequence roles from this user and add the new sequence role.
+    Runs on EVERY guild the bot and user share.
+    Uses the role_map table to find (pathway + sequence -> role_id).
+    """
     user = await get_user(discord_id)
     if not user:
         logger.warning(f"sync_user_roles: User {discord_id} not found in DB")
@@ -256,6 +278,7 @@ async def sync_user_roles(discord_id: str, new_sequence: int):
 
     pathway = user["pathway"]
 
+    # Loop through all guilds bot shares with user
     for guild in bot.guilds:
         member = guild.get_member(int(discord_id))
         if not member:
@@ -283,6 +306,8 @@ async def sync_user_roles(discord_id: str, new_sequence: int):
             if new_role:
                 await member.add_roles(new_role, reason="Sequence change")
                 logger.info(f"Added role {new_role.name} to {member.id}")
+        else:
+            logger.warning(f"No role mapped for pathway={pathway}, sequence={new_sequence}")
 
 # ---------- DIFFICULTY CONVERSION ----------
 def priority_to_difficulty(priority: float) -> str:
@@ -294,9 +319,13 @@ def priority_to_difficulty(priority: float) -> str:
         return "medium"
     return "hard"
 
-# ========== WEBHOOK HANDLER ==========
+# ========== WEBHOOK HANDLER WITH ROLE SYNC ==========
 async def handle_habitica(request: web.Request):
-    """Webhook handler for Habitica updates."""
+    """
+    Webhook handler for Habitica updates.
+    Handles: XP gain/loss, demotion (XP < 0), promotion (XP >= threshold).
+    Syncs roles automatically for each state change.
+    """
     try:
         data = await request.json()
         logger.info(f"RAW WEBHOOK DATA: {json.dumps(data)[:500]}")
@@ -304,20 +333,23 @@ async def handle_habitica(request: web.Request):
         logger.error(f"Error parsing webhook JSON: {e}")
         return web.Response(status=400, text="Invalid JSON")
 
+    # Extract Habitica fields
     task = data.get("task", {})
     user_id = task.get("userId") 
     direction = data.get("direction")
     
-    logger.info(f"Webhook received: user_id={user_id}, direction={direction}")
+    logger.info(f"Webhook received: user_id={user_id}, task={task}, direction={direction}")
     
     if not user_id or not task:
+        logger.warning(f"Invalid webhook: missing user_id or task")
         return web.Response(status=400, text="Invalid Webhook")
 
     discord_id = await resolve_habitica(user_id)
     if not discord_id:
+        logger.warning(f"Habitica user {user_id} not linked to Discord")
         return web.Response(status=404, text="Habitica user not linked")
 
-    task_type = task.get("type")
+    task_type = task.get("type")  # habit / daily / todo
     priority = float(task.get("priority", 1))
     difficulty = priority_to_difficulty(priority)
 
@@ -325,22 +357,31 @@ async def handle_habitica(request: web.Request):
     if direction == "down":
         xp = -abs(xp)
 
+    logger.info(f"Processing: {user_id} → Discord {discord_id}, {xp} XP ({task_type}, {difficulty})")
+
+    # Apply XP change
     result = await add_xp(discord_id, xp)
     announce_id = await get_config_value("announce_channel_id")
     announcement = f"<@{discord_id}> {'gained' if xp>0 else 'lost'} {abs(xp)} XP ({task_type}, {difficulty})"
 
+    # Send XP announcement
     if announce_id:
         channel = bot.get_channel(int(announce_id))
         if channel:
             await channel.send(announcement)
+            logger.info(f"Announcement sent to channel {announce_id}")
 
+    # Fetch updated user
     user = await get_user(discord_id)
     old_sequence = user["sequence"]
 
-    # DEMOTION
+    # ========== DEMOTION ==========
     if user["xp"] < 0:
         new_seq = min(old_sequence + 1, MAX_SEQUENCE)
         await set_user(discord_id, 0, user["pathway"], new_seq)
+        logger.info(f"DEMOTION: {discord_id} sequence {old_sequence} → {new_seq}, XP reset to 0")
+
+        # Sync roles after demotion
         await sync_user_roles(discord_id, new_seq)
 
         if announce_id:
@@ -350,7 +391,7 @@ async def handle_habitica(request: web.Request):
 
         user = await get_user(discord_id)
 
-    # PROMOTION LOOP
+    # ========== PROMOTION LOOP ==========
     leveled = []
     while True:
         seq = user["sequence"]
@@ -363,6 +404,7 @@ async def handle_habitica(request: web.Request):
             new_seq = seq - 1
             await set_user(discord_id, user["xp"], user["pathway"], new_seq)
             leveled.append((seq, new_seq))
+            logger.info(f"PROMOTION: {discord_id} sequence {seq} → {new_seq}, XP now {user['xp']}")
 
             if announce_id:
                 channel = bot.get_channel(int(announce_id))
@@ -373,11 +415,12 @@ async def handle_habitica(request: web.Request):
         else:
             break
 
+    # Final role sync after all promotions
     await sync_user_roles(discord_id, user["sequence"])
 
     return web.json_response({"ok": True, "xp": xp, "leveled": leveled})
 
-# ---------- Webserver ----------
+# ---------- Start aiohttp server ----------
 async def start_webserver():
     app = web.Application()
     app.router.add_post("/webhook/habitica", handle_habitica)
@@ -413,6 +456,10 @@ async def link(ctx, habitica_user_id: str):
 @bot.command()
 @is_admin()
 async def setuserxp(ctx, member: discord.Member, xp: int):
+    """
+    Set a user's XP directly and apply promotions + sync roles.
+    Usage: !setuserxp @User 1500
+    """
     discord_id = str(member.id)
     u = await get_user(discord_id)
     if not u:
@@ -425,9 +472,14 @@ async def setuserxp(ctx, member: discord.Member, xp: int):
 
     await ctx.send(f"Set {member.mention}'s XP to {u['xp']}. Sequence is now {u['sequence']}.")
 
+
 @bot.command()
 @is_admin()
 async def addxp(ctx, member: discord.Member, amount: int):
+    """
+    Add XP to a user and apply promotions + sync roles.
+    Usage: !addxp @User 200
+    """
     discord_id = str(member.id)
     u = await get_user(discord_id)
     if not u:
@@ -444,6 +496,10 @@ async def addxp(ctx, member: discord.Member, amount: int):
 @bot.command()
 @is_admin()
 async def subtractxp(ctx, member: discord.Member, amount: int):
+    """
+    Subtract XP from a user, apply demotion if XP goes below 0, then re-run promotion logic + sync roles.
+    Usage: !subtractxp @User 100
+    """
     discord_id = str(member.id)
     u = await get_user(discord_id)
 
@@ -453,6 +509,7 @@ async def subtractxp(ctx, member: discord.Member, amount: int):
 
     new_xp = u["xp"] - amount
 
+    # Demotion logic: if XP < 0, reset to 0 and increase sequence (demote)
     if new_xp < 0:
         new_xp = 0
         new_seq = min(u["sequence"] + 1, MAX_SEQUENCE)
@@ -463,16 +520,20 @@ async def subtractxp(ctx, member: discord.Member, amount: int):
     u = await apply_promotions(discord_id)
     await sync_user_roles(discord_id, u["sequence"])
 
-    await ctx.send(f"Subtracted {amount} XP from {member.mention}. XP: {u['xp']}, Sequence: {u['sequence']}.")
+    await ctx.send(
+        f"Subtracted {amount} XP from {member.mention}. "
+        f"XP: {u['xp']}, Sequence: {u['sequence']}."
+    )
 
 @bot.command()
 @is_admin()
 async def setxp(ctx, task_type: str, difficulty: str, xp: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO xp_map (task_type, difficulty, xp) VALUES ($1, $2, $3) ON CONFLICT (task_type, difficulty) DO UPDATE SET xp = $3",
-            task_type, difficulty, xp
-        )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+        INSERT OR REPLACE INTO xp_map (task_type, difficulty, xp)
+        VALUES (?, ?, ?)
+        """, (task_type, difficulty, xp))
+        await db.commit()
     await ctx.send("XP updated.")
 
 @bot.command()
@@ -484,6 +545,7 @@ async def setthreshold(ctx, sequence: int, xp_required: int):
 @bot.command()
 @is_admin()
 async def setpathwayrole(ctx, pathway: int, role: discord.Role):
+    """Set the pathway role for this guild. Usage: !setpathwayrole 1 @PathwayRole"""
     if pathway < 1 or pathway > NUM_PATHWAYS:
         await ctx.send(f"Pathway must be between 1 and {NUM_PATHWAYS}.")
         return
@@ -493,6 +555,7 @@ async def setpathwayrole(ctx, pathway: int, role: discord.Role):
 @bot.command()
 @is_admin()
 async def maprole(ctx, pathway: int, sequence: int, role: discord.Role):
+    """Map a Discord role to a pathway + sequence combo. Usage: !maprole 1 5 @RoleName"""
     await map_role(pathway, sequence, role.id)
     await ctx.send(f"Pathway {pathway}, Sequence {sequence} → {role.mention}")
 
@@ -514,28 +577,41 @@ async def xp(ctx, member: Optional[discord.Member]):
     pathway_num = u["pathway"]
     seq_num = u["sequence"]
 
+    # Default to showing the number
     pathway_label = f"{pathway_num}"
+
+    # Try to get the mapped pathway role name
     pathway_role_id = await get_pathway_role(guild.id, pathway_num)
     if pathway_role_id:
         r = guild.get_role(pathway_role_id)
         if r:
             pathway_label = r.name
 
-    await ctx.send(f"{m.mention} → XP: {u['xp']}, Pathway: {pathway_label}, Sequence: {seq_num}")
+    await ctx.send(
+        f"{m.mention} → XP: {u['xp']}, "
+        f"Pathway: {pathway_label}, "
+        f"Sequence: {seq_num}"
+    )
 
 @bot.command()
 async def leaderboard(ctx, top: int = 10):
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT discord_id, xp FROM users ORDER BY xp DESC LIMIT $1", top)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("""
+        SELECT discord_id, xp FROM users ORDER BY xp DESC LIMIT ?
+        """, (top,))
+        rows = await cur.fetchall()
     if not rows:
         await ctx.send("No data.")
         return
-    text = "\n".join([f"{i+1}. <@{r['discord_id']}> – {r['xp']} XP" for i, r in enumerate(rows)])
+    text = "\n".join([f"{i+1}. <@{r[0]}> – {r[1]} XP" for i, r in enumerate(rows)])
     await ctx.send(text)
 
-# ---------- MAIN ----------
+# ---------- MAIN ASYNC RUNNER ----------
 async def main():
+    # Start webhook server
     await start_webserver()
+    
+    # Run Discord bot
     async with bot:
         await bot.start(DISCORD_TOKEN)
 
